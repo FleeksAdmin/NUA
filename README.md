@@ -1,4 +1,4 @@
-# na_urok
+# NUA
 
 Инструкция по запуску `main.py` на Windows.
 
