@@ -48,7 +48,7 @@ SYSTEM_PROMPT_FL = """Ти експерт зі шкільних тестів 7 �
 OCR_SPACE_URL = "https://api.ocr.space/parse/image"
 OCR_SPACE_API_KEY = "helloworld"
 OCR_SPACE_LANGUAGE = "eng"
-G4F_URL = "https://g4f.space/api/nvidia/chat/completions"
+G4F_URL = "https://g4f.space/api/groq/chat/completions"
 OCR_LANGS_DEFAULT = ["eng"]
 OCR_ENGINES = [2, 1]
 OCR_LANGS_ACTIVE = list(OCR_LANGS_DEFAULT)
@@ -85,6 +85,22 @@ def html_to_text(raw: str) -> str:
 
 def clean_ids(ids):
     return [str(x).strip().replace("id=", "").strip() for x in ids if str(x).strip()]
+
+
+def normalize_answer_ids_for_question(question, answer_ids):
+    answer_ids = clean_ids(answer_ids)
+    if not question:
+        return answer_ids
+
+    option_ids = {str(opt.get("id")) for opt in question.get("options", [])}
+    filtered = [oid for oid in answer_ids if oid in option_ids]
+    qtype = (question.get("type") or "").strip().lower()
+
+    if qtype == "quiz":
+        return filtered if len(filtered) == 1 else []
+    if qtype == "multiquiz":
+        return filtered if 1 <= len(filtered) <= 4 else []
+    return filtered
 
 
 def strip_code_fences(text: str) -> str:
@@ -701,16 +717,18 @@ def _ingest_stream_chunk(
         qid = str(data.get("question_id", "")).strip()
         if qid not in known_qids:
             continue
+        question = question_by_qid.get(qid, {})
         if use_fl:
             answer_texts = extract_answer_texts(obj_text)
-            answer_ids = map_answer_texts_to_ids(question_by_qid.get(qid, {}), answer_texts)
+            answer_ids = map_answer_texts_to_ids(question, answer_texts)
         else:
             answer_ids = clean_ids(data.get("answer_ids", []))
+        answer_ids = normalize_answer_ids_for_question(question, answer_ids)
         with lock:
             answers_map[qid] = answer_ids
         if qid not in solved_qids:
             solved_qids.add(qid)
-        print(f"[AI-stream] {len(solved_qids)}/{total} qid={qid} -> {answer_ids}")
+        print(f"[AI-parse] {len(solved_qids)}/{total} qid={qid} -> {answer_ids}")
     return pending_buf
 
 
@@ -730,13 +748,13 @@ def ask_batch_questions_stream(questions, use_gpt, gpt_model, answers_map, lock,
             "Referer": "https://g4f.dev/",
             "User-Agent": "Mozilla/5.0",
         }
+        # g4f/groq endpoint expects a user message payload.
+        user_prompt = f"{system_prompt}\n\n{prompt}"
         payload = {
             "model": gpt_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            "stream": True,
+            "messages": [{"role": "user", "content": user_prompt}],
+            "stream": False,
+            "stream_options": {"include_usage": True},
         }
     else:
         url = "https://api.deepseek.com/v1/chat/completions"
@@ -758,16 +776,47 @@ def ask_batch_questions_stream(questions, use_gpt, gpt_model, answers_map, lock,
         if use_gpt:
             _acquire_g4f_slot(min_interval=G4F_MIN_INTERVAL)
         try:
-            with requests.post(url, headers=headers, json=payload, timeout=timeout, stream=True) as resp:
+            if use_gpt:
+                resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
                 if resp.status_code == 429:
                     raise requests.HTTPError("429 Too Many Requests", response=resp)
                 resp.raise_for_status()
-                content_type = (resp.headers.get("content-type") or "").lower()
+                full_text = get_content_from_response(resp)
+                pending_buf = _ingest_stream_chunk(
+                    full_text,
+                    pending_buf,
+                    answers_map,
+                    lock,
+                    known_qids,
+                    solved_qids,
+                    len(questions),
+                    question_by_qid,
+                    use_fl=use_fl,
+                )
+            else:
+                with requests.post(url, headers=headers, json=payload, timeout=timeout, stream=True) as resp:
+                    if resp.status_code == 429:
+                        raise requests.HTTPError("429 Too Many Requests", response=resp)
+                    resp.raise_for_status()
+                    content_type = (resp.headers.get("content-type") or "").lower()
 
-                if "text/event-stream" in content_type:
-                    for chunk in _iter_sse_delta_text(resp):
+                    if "text/event-stream" in content_type:
+                        for chunk in _iter_sse_delta_text(resp):
+                            pending_buf = _ingest_stream_chunk(
+                                chunk,
+                                pending_buf,
+                                answers_map,
+                                lock,
+                                known_qids,
+                                solved_qids,
+                                len(questions),
+                                question_by_qid,
+                                use_fl=use_fl,
+                            )
+                    else:
+                        full_text = resp.text
                         pending_buf = _ingest_stream_chunk(
-                            chunk,
+                            full_text,
                             pending_buf,
                             answers_map,
                             lock,
@@ -777,19 +826,6 @@ def ask_batch_questions_stream(questions, use_gpt, gpt_model, answers_map, lock,
                             question_by_qid,
                             use_fl=use_fl,
                         )
-                else:
-                    full_text = resp.text
-                    pending_buf = _ingest_stream_chunk(
-                        full_text,
-                        pending_buf,
-                        answers_map,
-                        lock,
-                        known_qids,
-                        solved_qids,
-                        len(questions),
-                        question_by_qid,
-                        use_fl=use_fl,
-                    )
             break
         except Exception as e:
             last_error = e
@@ -915,6 +951,7 @@ def ask_gpt_with_backoff(
     use_fl=False,
 ):
     last_error = None
+    merged_prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
     for attempt in range(max_retries + 1):
         _acquire_g4f_slot(min_interval=min_interval)
         try:
@@ -928,11 +965,9 @@ def ask_gpt_with_backoff(
                 },
                 json={
                     "model": model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": prompt},
-                    ],
+                    "messages": [{"role": "user", "content": merged_prompt}],
                     "stream": False,
+                    "stream_options": {"include_usage": True},
                 },
                 timeout=timeout,
             )
@@ -994,7 +1029,7 @@ def resolve_answers_worker(
         else:
             unresolved.append(q)
 
-    # 2) One batch request for all unresolved questions with streaming incremental parsing.
+    # 2) One batch request for all unresolved questions.
     if unresolved:
         try:
             solved = ask_batch_questions_stream(
@@ -1008,6 +1043,39 @@ def resolve_answers_worker(
             print(f"[AI-batch] solved={len(solved)}/{len(unresolved)}")
         except Exception as e:
             print(f"[AI-batch] error: {e}")
+
+    # g4f mode: mostly single batch request.
+    # If a batch answer has no valid option id for that question, retry only that question once.
+    if use_gpt:
+        retry_single = []
+        with lock:
+            for q in questions:
+                qid = str(q.get("id"))
+                normalized = normalize_answer_ids_for_question(q, answers_map.get(qid, []))
+                answers_map[qid] = normalized
+                if not normalized:
+                    retry_single.append(q)
+
+        if retry_single:
+            print(f"[AI-batch] single-request mode unresolved={len(retry_single)} -> retry one-by-one")
+            for idx, q in enumerate(retry_single, start=1):
+                qid = str(q.get("id"))
+                try:
+                    answer_ids = ask_question_gpt(
+                        q,
+                        model=gpt_model,
+                        min_interval=G4F_MIN_INTERVAL,
+                        max_retries=G4F_MAX_RETRIES,
+                        use_fl=True,
+                    )
+                    answer_ids = normalize_answer_ids_for_question(q, answer_ids)
+                except Exception as e:
+                    answer_ids = []
+                    print(f"[AI-single] {idx}/{len(retry_single)} qid={qid} error: {e}")
+                with lock:
+                    answers_map[qid] = answer_ids
+                print(f"[AI-single] {idx}/{len(retry_single)} qid={qid} -> {answer_ids}")
+        return
 
     # 3) Fallback per-question only for those still unresolved.
     for idx, q in enumerate(questions, start=1):
@@ -1170,6 +1238,17 @@ def get_current_question_position(driver):
     return None
 
 
+def get_page_reload_marker(driver):
+    try:
+        marker = driver.execute_script("return Number(performance.timeOrigin || 0);")
+    except Exception:
+        return 0.0
+    try:
+        return float(marker or 0.0)
+    except Exception:
+        return 0.0
+
+
 def click_answers(driver, question, answer_ids):
     answer_set = set(clean_ids(answer_ids))
     if not answer_set:
@@ -1318,6 +1397,7 @@ def main():
     driver.get(args.url)
     time.sleep(3)
     inject_watermark(driver)
+    page_reload_marker = get_page_reload_marker(driver)
 
     answers_map = {}
     answers_lock = threading.Lock()
@@ -1350,6 +1430,22 @@ def main():
     while True:
         try:
             time.sleep(0.25)
+            current_marker = get_page_reload_marker(driver)
+            if (
+                current_marker
+                and page_reload_marker
+                and abs(current_marker - page_reload_marker) > 0.001
+            ):
+                page_reload_marker = current_marker
+                auto_clicked_qids.clear()
+                qid_seen_at.clear()
+                last_qid = None
+                highlighted_qid = None
+                clear_highlights(driver)
+                print("[AUTO] reload detected, state reset")
+            elif current_marker:
+                page_reload_marker = current_marker
+
             current_qid = None
             current_position = get_current_question_position(driver)
             if current_position and 1 <= current_position <= len(ordered_qids):
@@ -1378,6 +1474,14 @@ def main():
                 continue
 
             question = question_index[current_qid]["question"]
+            normalized_ids = normalize_answer_ids_for_question(question, current_answer_ids)
+            if normalized_ids != clean_ids(current_answer_ids):
+                with answers_lock:
+                    answers_map[current_qid] = normalized_ids
+            current_answer_ids = normalized_ids
+            if not current_answer_ids:
+                continue
+
             if args.auto and current_qid not in auto_clicked_qids:
                 seen_at = qid_seen_at.get(current_qid, time.monotonic())
                 if time.monotonic() - seen_at < AUTO_STABLE_SECONDS:
