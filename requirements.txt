@@ -1,0 +1,4 @@
+requests
+selenium
+Pillow
+rapidocr-onnxruntime
